@@ -1,16 +1,14 @@
-import path from "path";
+import path from "node:path";
+import deepmerge, { type Options as MergeOptions } from "@fastify/deepmerge";
 
-import { EmitterWebhookEvent as WebhookEvent } from "@octokit/webhooks";
-import merge from "deepmerge";
-
+import type {
+  EmitterWebhookEvent as WebhookEvent,
+  EmitterWebhookEventName as WebhookEvents,
+} from "@octokit/webhooks";
 import type { Logger } from "pino";
+import type { ProbotOctokit } from "./octokit/probot-octokit.js";
 
-import { ProbotOctokit } from "./octokit/probot-octokit";
-import { aliasLog } from "./helpers/alias-log";
-import { DeprecatedLogger } from "./types";
-import { EmitterWebhookEventName as WebhookEvents } from "@octokit/webhooks/dist-types/types";
-
-export type MergeOptions = merge.Options;
+export type { MergeOptions };
 
 /** Repo owner type, either string or never depending on the context */
 type RepoOwnerType<T extends WebhookEvents> =
@@ -31,12 +29,12 @@ type RepoIssueNumberType<T extends WebhookEvents> =
   WebhookEvent<T>["payload"] extends { issue: { number: number } }
     ? number
     : never | WebhookEvent<T>["payload"] extends {
-        pull_request: { number: number };
-      }
-    ? number
-    : never | WebhookEvent<T>["payload"] extends { number: number }
-    ? number
-    : never;
+          pull_request: { number: number };
+        }
+      ? number
+      : never | WebhookEvent<T>["payload"] extends { number: number }
+        ? number
+        : never;
 
 /** Context.repo return type */
 type RepoResultType<E extends WebhookEvents> = {
@@ -44,41 +42,57 @@ type RepoResultType<E extends WebhookEvents> = {
   repo: RepoNameType<E>;
 };
 
+const octokitsWithRequestHook = new WeakSet<ProbotOctokit>();
+
 /**
  * The context of the event that was triggered, including the payload and
  * helpers for extracting information can be passed to GitHub API calls.
  *
  *  ```js
- *  module.exports = app => {
+ *  export default app => {
  *    app.on('push', context => {
  *      context.log.info('Code was pushed to the repo, what should we do with it?');
  *    });
  *  };
  *  ```
- *
- * @property {octokit} octokit - An Octokit instance
- * @property {payload} payload - The webhook event payload
- * @property {log} log - A pino instance
  */
-export class Context<E extends WebhookEvents = WebhookEvents> {
+export class Context<Event extends WebhookEvents = WebhookEvents> {
   public name: WebhookEvents;
   public id: string;
-  public payload: WebhookEvent<E>["payload"];
+  public payload: {
+    [K in Event]: K extends WebhookEvents ? WebhookEvent<K> : never;
+  }[Event]["payload"];
 
-  public octokit: InstanceType<typeof ProbotOctokit>;
-  public log: DeprecatedLogger;
+  /**
+   * An authenticated Octokit instance that can be used to make GitHub API
+   * requests in the context of the webhook event.
+   */
+  public octokit: ProbotOctokit;
 
-  constructor(
-    event: WebhookEvent<E>,
-    octokit: InstanceType<typeof ProbotOctokit>,
-    log: Logger
-  ) {
+  /**
+   * A logger with context about the event.
+   */
+  public log: Logger;
+
+  constructor(event: WebhookEvent<Event>, octokit: ProbotOctokit, log: Logger) {
     this.name = event.name;
     this.id = event.id;
     this.payload = event.payload;
 
     this.octokit = octokit;
-    this.log = aliasLog(log);
+    this.log = log;
+
+    // set `x-github-delivery` header on all requests sent in response to the current
+    // event. This allows GitHub Support to correlate the request with the event.
+    // This is not documented and not considered public API, the header may change.
+    // Once we document this as best practice on https://docs.github.com/en/rest/guides/best-practices-for-integrators
+    // we will make it official
+    if (!octokitsWithRequestHook.has(octokit)) {
+      octokit.hook.before("request", (options) => {
+        options.headers["x-github-delivery"] = event.id;
+      });
+      octokitsWithRequestHook.add(octokit);
+    }
   }
 
   /**
@@ -93,13 +107,13 @@ export class Context<E extends WebhookEvents = WebhookEvents> {
    * @param object - Params to be merged with the repo params.
    *
    */
-  public repo<T>(object?: T): RepoResultType<E> & T {
-    // @ts-ignore `repository` is not always present in this.payload
+  public repo<T>(object?: T): RepoResultType<Event> & T {
+    // @ts-expect-error `repository` is not always present in this.payload
     const repo = this.payload.repository;
 
     if (!repo) {
       throw new Error(
-        "context.repo() is not supported for this webhook event."
+        "context.repo() is not supported for this webhook event.",
       );
     }
 
@@ -108,7 +122,7 @@ export class Context<E extends WebhookEvents = WebhookEvents> {
         owner: repo.owner.login,
         repo: repo.name,
       },
-      object
+      object,
     );
   }
 
@@ -125,16 +139,16 @@ export class Context<E extends WebhookEvents = WebhookEvents> {
    * @param object - Params to be merged with the issue params.
    */
   public issue<T>(
-    object?: T
-  ): RepoResultType<E> & { issue_number: RepoIssueNumberType<E> } & T {
+    object?: T,
+  ): RepoResultType<Event> & { issue_number: RepoIssueNumberType<Event> } & T {
     return Object.assign(
       {
         issue_number:
-          // @ts-ignore - this.payload may not have `issue` or `pull_request` keys
+          // @ts-expect-error - this.payload may not have `issue` or `pull_request` keys
           (this.payload.issue || this.payload.pull_request || this.payload)
             .number,
       },
-      this.repo(object)
+      this.repo(object),
     );
   }
 
@@ -151,15 +165,15 @@ export class Context<E extends WebhookEvents = WebhookEvents> {
    * @param object - Params to be merged with the pull request params.
    */
   public pullRequest<T>(
-    object?: T
-  ): RepoResultType<E> & { pull_number: RepoIssueNumberType<E> } & T {
+    object?: T,
+  ): RepoResultType<Event> & { pull_number: RepoIssueNumberType<Event> } & T {
     const payload = this.payload;
     return Object.assign(
       {
-        // @ts-ignore - this.payload may not have `issue` or `pull_request` keys
+        // @ts-expect-error - this.payload may not have `issue` or `pull_request` keys
         pull_number: (payload.issue || payload.pull_request || payload).number,
       },
-      this.repo(object)
+      this.repo(object),
     );
   }
 
@@ -167,10 +181,10 @@ export class Context<E extends WebhookEvents = WebhookEvents> {
    * Returns a boolean if the actor on the event was a bot.
    * @type {boolean}
    */
-  get isBot() {
-    // @ts-expect-error - `sender` key is currently not present in all events
+  get isBot(): boolean {
+    // `sender` key is not present in all events
     // see https://github.com/octokit/webhooks/issues/510
-    return this.payload.sender.type === "Bot";
+    return this.payload.sender?.type === "Bot";
   }
 
   /**
@@ -191,8 +205,8 @@ export class Context<E extends WebhookEvents = WebhookEvents> {
    * const config = await context.config('config.yml')
    *
    * if (config.close) {
-   *   context.octokit.issues.comment(context.issue({body: config.comment}))
-   *   context.octokit.issues.edit(context.issue({state: 'closed'}))
+   *   context.octokit.rest.issues.comment(context.issue({body: config.comment}))
+   *   context.octokit.rest.issues.edit(context.issue({state: 'closed'}))
    * }
    * ```
    *
@@ -203,8 +217,8 @@ export class Context<E extends WebhookEvents = WebhookEvents> {
    * const config = await context.config('config.yml', {comment: 'Make sure to check all the specs.'})
    *
    * if (config.close) {
-   *   context.octokit.issues.comment(context.issue({body: config.comment}));
-   *   context.octokit.issues.edit(context.issue({state: 'closed'}))
+   *   context.octokit.rest.issues.comment(context.issue({body: config.comment}));
+   *   context.octokit.rest.issues.edit(context.issue({state: 'closed'}))
    * }
    * ```
    *
@@ -219,31 +233,30 @@ export class Context<E extends WebhookEvents = WebhookEvents> {
    *
    * @param fileName - Name of the YAML file in the `.github` directory
    * @param defaultConfig - An object of default config options
-   * @param deepMergeOptions - Controls merging configs (from the [deepmerge](https://github.com/TehShrike/deepmerge) module)
+   * @param deepMergeOptions - Controls how configuration files are merged
    * @return Configuration object read from the file
    */
   public async config<T>(
     fileName: string,
     defaultConfig?: T,
-    deepMergeOptions?: MergeOptions
+    deepMergeOptions?: MergeOptions,
   ): Promise<T | null> {
     const params = this.repo({
       path: path.posix.join(".github", fileName),
-      defaults(configs: object[]) {
-        const result = merge.all(
-          [defaultConfig || {}, ...configs],
-          deepMergeOptions
+      defaults(configs: Record<string, unknown>[]) {
+        const result = deepmerge({ ...deepMergeOptions, all: true })(
+          defaultConfig || {},
+          ...configs,
         );
 
-        return result;
+        return result as Record<string, unknown>;
       },
     });
 
-    // @ts-ignore
     const { config, files } = await this.octokit.config.get(params);
 
     // if no default config is set, and no config files are found, return null
-    if (!defaultConfig && !files.find((file: any) => file.config !== null)) {
+    if (!defaultConfig && !files.find((file) => file.config !== null)) {
       return null;
     }
 

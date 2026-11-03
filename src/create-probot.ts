@@ -1,24 +1,26 @@
-import { LogLevel, Options as PinoOptions } from "@probot/pino";
 import { getPrivateKey } from "@probot/get-private-key";
 
-import { getLog, GetLogOptions } from "./helpers/get-log";
-import { Options } from "./types";
-import { Probot } from "./probot";
+import type { Env, Options } from "./types.js";
+import { Probot } from "./probot.js";
+import { defaultWebhookPath } from "./server/server.js";
+import { validateLogFormat } from "./helpers/validate-log-format.js";
+import { validateLogLevel } from "./helpers/validate-log-level.js";
 
 type CreateProbotOptions = {
   overrides?: Options;
   defaults?: Options;
-  env?: NodeJS.ProcessEnv;
+  env?: Partial<Env> | undefined;
 };
 
-const DEFAULTS = {
+const DEFAULTS: Partial<Env> = {
   APP_ID: "",
   WEBHOOK_SECRET: "",
+  WEBHOOK_PATH: defaultWebhookPath,
   GHE_HOST: "",
-  GHE_PROTOCOL: "",
-  LOG_FORMAT: "",
+  GHE_PROTOCOL: "https",
+  LOG_FORMAT: undefined,
   LOG_LEVEL: "warn",
-  LOG_LEVEL_IN_STRING: "",
+  LOG_LEVEL_IN_STRING: "false",
   LOG_MESSAGE_KEY: "msg",
   REDIS_URL: "",
   SENTRY_DSN: "",
@@ -37,16 +39,30 @@ export function createProbot({
   overrides = {},
   defaults = {},
   env = process.env,
-}: CreateProbotOptions = {}) {
-  const privateKey = getPrivateKey({ env });
+}: CreateProbotOptions = {}): Probot {
+  let privateKey;
+
+  try {
+    privateKey = getPrivateKey({ env });
+  } catch {}
+
   const envWithDefaults = { ...DEFAULTS, ...env };
 
-  const envOptions: Options = {
-    logLevel: envWithDefaults.LOG_LEVEL as LogLevel,
+  const envLogFormat =
+    envWithDefaults.LOG_FORMAT === ""
+      ? envWithDefaults.NODE_ENV === "production"
+        ? "json"
+        : "pretty"
+      : envWithDefaults.LOG_FORMAT;
+
+  const envOptions = {
+    logLevel: envWithDefaults.LOG_LEVEL,
+    logFormat: envLogFormat,
     appId: Number(envWithDefaults.APP_ID),
-    privateKey: (privateKey && privateKey.toString()) || undefined,
+    privateKey: privateKey ? privateKey.toString() : undefined,
     secret: envWithDefaults.WEBHOOK_SECRET,
     redisConfig: envWithDefaults.REDIS_URL,
+    webhookPath: envWithDefaults.WEBHOOK_PATH,
     baseUrl: envWithDefaults.GHE_HOST
       ? `${envWithDefaults.GHE_PROTOCOL || "https"}://${
           envWithDefaults.GHE_HOST
@@ -60,18 +76,21 @@ export function createProbot({
     ...overrides,
   };
 
-  const logOptions: GetLogOptions = {
-    level: probotOptions.logLevel,
-    logFormat: envWithDefaults.LOG_FORMAT as PinoOptions["logFormat"],
+  const { logLevel, logFormat } = probotOptions;
+  if (logLevel !== undefined) {
+    validateLogLevel(logLevel);
+  }
+  if (logFormat !== undefined) {
+    validateLogFormat(logFormat);
+  }
+
+  return new Probot({
+    log: probotOptions.log,
     logLevelInString: envWithDefaults.LOG_LEVEL_IN_STRING === "true",
     logMessageKey: envWithDefaults.LOG_MESSAGE_KEY,
     sentryDsn: envWithDefaults.SENTRY_DSN,
-  };
-
-  const log = getLog(logOptions).child({ name: "server" });
-
-  return new Probot({
-    log: log.child({ name: "probot" }),
     ...probotOptions,
+    logLevel,
+    logFormat,
   });
 }

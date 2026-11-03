@@ -1,24 +1,25 @@
-import { sync } from "resolve";
+import { resolve } from "import-meta-resolve";
+import { pathToFileURL } from "node:url";
+import type { ApplicationFunction } from "../types.js";
 
-const defaultOptions: ResolveOptions = {};
-
+type ImportMetaResolve = (specifier: string, parent?: string) => string;
 export const resolveAppFunction = async (
   appFnId: string,
-  opts?: ResolveOptions
-) => {
-  opts = opts || defaultOptions;
+  opts: ResolveOptions = {},
+): Promise<ApplicationFunction> => {
   // These are mostly to ease testing
-  const basedir = opts.basedir || process.cwd();
-  const resolver: Resolver = opts.resolver || sync;
-  const appFnPath = resolver(appFnId, { basedir });
-  const mod = await import(appFnPath);
-  // Note: This needs "esModuleInterop" to be set to "true" in "tsconfig.json"
-  return mod.default;
+  const basedir = process.cwd();
+  const resolver = opts.resolver || resolve;
+  const appFnPath = resolver(appFnId, pathToFileURL(basedir).href + "/");
+
+  const { default: mod } = await import(appFnPath);
+  // mod.default gets exported by transpiled TypeScript code
+  if (mod.__esModule) {
+    return mod.default || mod;
+  }
+  return mod;
 };
-
-export type Resolver = (appFnId: string, opts: { basedir: string }) => string;
-
 export interface ResolveOptions {
   basedir?: string;
-  resolver?: Resolver;
+  resolver?: ImportMetaResolve;
 }

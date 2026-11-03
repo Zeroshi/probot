@@ -1,264 +1,511 @@
-import fs = require("fs");
-import path = require("path");
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { EmitterWebhookEvent as WebhookEvent } from "@octokit/webhooks";
-import WebhookExamples, { WebhookDefinition } from "@octokit/webhooks-examples";
-import nock from "nock";
+import type {
+  EmitterWebhookEvent as WebhookEvent,
+  EmitterWebhookEventName,
+} from "@octokit/webhooks";
+import WebhookExamples from "@octokit/webhooks-examples";
+import fetchMock from "fetch-mock";
+import { pino } from "pino";
+import { describe, expect, test, it, vi } from "vitest";
 
-import { Context } from "../src";
-import { ProbotOctokit } from "../src/octokit/probot-octokit";
-import { PushEvent } from "@octokit/webhooks-types";
+import { Context } from "../src/index.js";
+import { ProbotOctokit } from "../src/octokit/probot-octokit.js";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+type GetWebhookEventPayload<T extends EmitterWebhookEventName> =
+  WebhookEvent<T>["payload"];
+
+type WebhookDefinition<
+  TName extends EmitterWebhookEventName = EmitterWebhookEventName,
+> = {
+  name: TName;
+  actions: string[];
+  description: string;
+  examples: GetWebhookEventPayload<TName>[];
+  properties: Record<
+    string,
+    {
+      description: string;
+      type:
+        | "string"
+        | "number"
+        | "boolean"
+        | "object"
+        | "integer"
+        | "array"
+        | "null";
+    }
+  >;
+};
+
+type PushEvent = GetWebhookEventPayload<"push">;
+
+const webhookExamples = WebhookExamples as unknown as WebhookDefinition[];
 const pushEventPayload = (
-  WebhookExamples.filter(
-    (event) => event.name === "push"
-  )[0] as WebhookDefinition<"push">
+  webhookExamples.filter(
+    (event) => event.name === "push",
+  )[0] as unknown as WebhookDefinition<"push">
 ).examples[0];
 const issuesEventPayload = (
-  WebhookExamples.filter(
-    (event) => event.name === "issues"
-  )[0] as WebhookDefinition<"issues">
+  webhookExamples.filter(
+    (event) => event.name === "issues",
+  )[0] as unknown as WebhookDefinition<"issues">
 ).examples[0];
 const pullRequestEventPayload = (
-  WebhookExamples.filter(
-    (event) => event.name === "pull_request"
-  )[0] as WebhookDefinition<"pull_request">
-).examples[0];
+  webhookExamples.filter(
+    (event) => event.name === "pull_request",
+  )[0] as unknown as WebhookDefinition<"pull_request">
+).examples[0] as WebhookEvent<"pull_request">["payload"];
 
 describe("Context", () => {
-  let event: WebhookEvent<"push"> = {
+  const log = pino({ level: "silent" });
+  const event: WebhookEvent<"push"> = {
     id: "0",
     name: "push",
     payload: pushEventPayload,
   };
+  const octokit = {
+    hook: {
+      before: () => {},
+    },
+  };
   let context: Context<"push"> = new Context<"push">(
     event,
-    {} as any,
-    {} as any
+    octokit as unknown as ProbotOctokit,
+    log,
   );
 
   it("inherits the payload", () => {
     expect(context.payload).toBe(event.payload);
   });
 
-  describe("repo", () => {
-    let event: WebhookEvent<"push">;
-    let context: Context<"push">;
-    beforeEach(() => {
-      event = {
-        id: "123",
-        name: "push",
-        payload: pushEventPayload,
-      };
+  it("adds the delivery hook only once per Octokit instance", () => {
+    type RequestOptions = { headers: Record<string, string> };
+    let requestHook: ((options: RequestOptions) => void) | undefined;
+    const before = vi.fn(
+      (_name: string, hook: (options: RequestOptions) => void) => {
+        requestHook = hook;
+      },
+    );
+    const octokit = { hook: { before } };
 
-      context = new Context<"push">(event, {} as any, {} as any);
-    });
+    new Context(
+      { ...event, id: "delivery-id" },
+      octokit as unknown as ProbotOctokit,
+      log,
+    );
+    new Context(
+      { ...event, id: "second-delivery-id" },
+      octokit as unknown as ProbotOctokit,
+      log,
+    );
+
+    expect(before).toHaveBeenCalledTimes(1);
+    if (!requestHook) throw new Error("request hook was not registered");
+
+    const options: RequestOptions = { headers: {} };
+    requestHook(options);
+    expect(options.headers["x-github-delivery"]).toBe("delivery-id");
+  });
+
+  describe("repo", () => {
+    const event = {
+      id: "123",
+      name: "push",
+      payload: pushEventPayload,
+    } as WebhookEvent<"push">;
+
+    const context = new Context<"push">(
+      event,
+      {
+        hook: {
+          before: () => {},
+        },
+      } as unknown as ProbotOctokit,
+      log,
+    );
 
     it("returns attributes from repository payload", () => {
-      expect(context.repo()).toEqual({
-        owner: "Codertocat",
-        repo: "Hello-World",
-      });
+      const repository = context.repo();
+
+      expect(typeof repository).toBe("object");
+      expect(Object.keys(repository).length).toBe(2);
+      expect(repository.owner).toBe("Codertocat");
+      expect(repository.repo).toBe("Hello-World");
     });
 
     it("merges attributes", () => {
-      expect(context.repo({ foo: 1, bar: 2 })).toEqual({
-        bar: 2,
-        foo: 1,
-        owner: "Codertocat",
-        repo: "Hello-World",
-      });
+      const repository = context.repo({ foo: 1, bar: 2 });
+
+      expect(typeof repository).toBe("object");
+      expect(Object.keys(repository).length).toBe(4);
+      expect(repository.owner).toBe("Codertocat");
+      expect(repository.repo).toBe("Hello-World");
+      expect(repository.foo).toBe(1);
+      expect(repository.bar).toBe(2);
     });
 
     it("overrides repo attributes", () => {
-      expect(context.repo({ owner: "muahaha" })).toEqual({
-        owner: "muahaha",
-        repo: "Hello-World",
-      });
+      const repository = context.repo({ owner: "muahaha" });
+
+      expect(typeof repository).toBe("object");
+      expect(Object.keys(repository).length).toBe(2);
+      expect(repository.owner).toBe("muahaha");
+      expect(repository.repo).toBe("Hello-World");
     });
 
     // The `repository` object on the push event has a different format than the other events
     // https://docs.github.com/en/developers/webhooks-and-events/webhook-events-and-payloads#push
     it("properly handles the push event", () => {
-      event.payload = require("./fixtures/webhook/push") as PushEvent;
+      const pushEvent = {
+        ...event,
+        payload: require("./fixtures/webhook/push") as PushEvent,
+      };
 
-      context = new Context<"push">(event, {} as any, {} as any);
-      expect(context.repo()).toEqual({ owner: "bkeepers-inc", repo: "test" });
+      const octokit = {
+        hook: {
+          before: () => {},
+        },
+      };
+
+      const context = new Context<"push">(
+        pushEvent,
+        octokit as unknown as ProbotOctokit,
+        log,
+      );
+
+      const repository = context.repo();
+
+      expect(typeof repository).toBe("object");
+      expect(Object.keys(repository).length).toBe(2);
+      expect(repository.owner).toBe("bkeepers-inc");
+      expect(repository.repo).toBe("test");
     });
 
     it("return error for context.repo() when repository doesn't exist", () => {
-      event = {
+      const event = {
         id: "123",
         name: "push",
-        payload: { ...pushEventPayload, repository: undefined as any },
+        payload: {
+          ...pushEventPayload,
+          repository:
+            undefined as unknown as typeof pushEventPayload.repository,
+        },
+      };
+      const octokit = {
+        hook: {
+          before: () => {},
+        },
       };
 
-      context = new Context<"push">(event, {} as any, {} as any);
-      try {
-        context.repo();
-      } catch (e) {
-        expect(e.message).toMatch(
-          "context.repo() is not supported for this webhook event."
-        );
-      }
+      const context = new Context<"push">(
+        event as WebhookEvent<"push">,
+        octokit as unknown as ProbotOctokit,
+        log,
+      );
+      expect(() => context.repo()).toThrow(
+        "context.repo() is not supported for this webhook event.",
+      );
     });
   });
 
   describe("issue", () => {
-    let event: WebhookEvent<"issues">;
-    let context: Context<"issues">;
-    beforeEach(() => {
-      event = {
+    const context = new Context<"issues">(
+      {
         id: "123",
         name: "issues",
         payload: issuesEventPayload,
-      };
+      } as WebhookEvent<"issues">,
+      {
+        hook: {
+          before: () => {},
+        },
+      } as unknown as ProbotOctokit,
+      log,
+    );
 
-      context = new Context<"issues">(event, {} as any, {} as any);
-    });
     it("returns attributes from repository payload", () => {
-      expect(context.issue()).toEqual({
-        owner: "Codertocat",
-        repo: "Hello-World",
-        issue_number: 1,
-      });
+      const issue = context.issue();
+
+      expect(typeof issue).toBe("object");
+      expect(Object.keys(issue).length).toBe(3);
+      expect(issue.owner).toBe("Codertocat");
+      expect(issue.repo).toBe("Hello-World");
+      expect(issue.issue_number).toBe(1);
     });
 
     it("merges attributes", () => {
-      expect(context.issue({ foo: 1, bar: 2 })).toEqual({
-        bar: 2,
-        foo: 1,
-        issue_number: 1,
-        owner: "Codertocat",
-        repo: "Hello-World",
-      });
+      const issue = context.issue({ foo: 1, bar: 2 });
+
+      expect(typeof issue).toBe("object");
+      expect(Object.keys(issue).length).toBe(5);
+      expect(issue.owner).toBe("Codertocat");
+      expect(issue.repo).toBe("Hello-World");
+      expect(issue.issue_number).toBe(1);
+      expect(issue.foo).toBe(1);
+      expect(issue.bar).toBe(2);
     });
 
     it("overrides repo attributes", () => {
-      expect(context.issue({ owner: "muahaha", issue_number: 5 })).toEqual({
-        issue_number: 5,
-        owner: "muahaha",
-        repo: "Hello-World",
-      });
+      const issue = context.issue({ owner: "muahaha", issue_number: 5 });
+
+      expect(typeof issue).toBe("object");
+      expect(Object.keys(issue).length).toBe(3);
+      expect(issue.owner).toBe("muahaha");
+      expect(issue.issue_number).toBe(5);
+      expect(issue.repo).toBe("Hello-World");
+    });
+
+    it("uses the event number when no issue or pull request is present", () => {
+      const context = new Context(
+        {
+          id: "123",
+          name: "push",
+          payload: {
+            ...pushEventPayload,
+            issue: undefined,
+            pull_request: undefined,
+            number: 7,
+          },
+        } as unknown as WebhookEvent<"push">,
+        { hook: { before: () => {} } } as unknown as ProbotOctokit,
+        log,
+      );
+
+      expect(context.issue().issue_number).toBe(7);
     });
   });
 
   describe("pullRequest", () => {
-    let event: WebhookEvent<"pull_request">;
-    let context: Context<"pull_request">;
-    beforeEach(() => {
-      event = {
-        id: "123",
-        name: "pull_request",
-        payload: pullRequestEventPayload,
-      };
+    const event = {
+      id: "123",
+      name: "pull_request",
+      payload: pullRequestEventPayload,
+    } as WebhookEvent<"pull_request">;
+    const context = new Context<"pull_request">(
+      event,
+      {
+        hook: {
+          before: () => {},
+        },
+      } as unknown as ProbotOctokit,
+      log,
+    );
 
-      context = new Context<"pull_request">(event, {} as any, {} as any);
-    });
     it("returns attributes from repository payload", () => {
-      expect(context.pullRequest()).toEqual({
-        owner: "Codertocat",
-        repo: "Hello-World",
-        pull_number: 2,
-      });
+      const pullRequest = context.pullRequest();
+
+      expect(typeof pullRequest).toBe("object");
+      expect(Object.keys(pullRequest).length).toBe(3);
+      expect(pullRequest.owner).toBe("Codertocat");
+      expect(pullRequest.repo).toBe("Hello-World");
+      expect(pullRequest.pull_number).toBe(2);
     });
 
     it("merges attributes", () => {
-      expect(context.pullRequest({ foo: 1, bar: 2 })).toEqual({
-        bar: 2,
-        foo: 1,
-        owner: "Codertocat",
-        pull_number: 2,
-        repo: "Hello-World",
-      });
+      const pullRequest = context.pullRequest({ foo: 1, bar: 2 });
+
+      expect(typeof pullRequest).toBe("object");
+      expect(Object.keys(pullRequest).length).toBe(5);
+      expect(pullRequest.owner).toBe("Codertocat");
+      expect(pullRequest.repo).toBe("Hello-World");
+      expect(pullRequest.pull_number).toBe(2);
+      expect(pullRequest.foo).toBe(1);
+      expect(pullRequest.bar).toBe(2);
     });
 
     it("overrides repo attributes", () => {
-      expect(context.pullRequest({ owner: "muahaha", pull_number: 5 })).toEqual(
+      const pullRequest = context.pullRequest({
+        owner: "muahaha",
+        pull_number: 5,
+      });
+
+      expect(typeof pullRequest).toBe("object");
+      expect(Object.keys(pullRequest).length).toBe(3);
+      expect(pullRequest.owner).toBe("muahaha");
+      expect(pullRequest.pull_number).toBe(5);
+      expect(pullRequest.repo).toBe("Hello-World");
+    });
+
+    it("uses an issue number when given an issue payload", () => {
+      const context = new Context(
         {
-          owner: "muahaha",
-          pull_number: 5,
-          repo: "Hello-World",
-        }
+          id: "123",
+          name: "pull_request",
+          payload: {
+            ...pullRequestEventPayload,
+            pull_request: undefined,
+            issue: { number: 8 },
+          },
+        } as unknown as WebhookEvent<"pull_request">,
+        { hook: { before: () => {} } } as unknown as ProbotOctokit,
+        log,
       );
+
+      expect(context.pullRequest().pull_number).toBe(8);
+    });
+
+    it("uses the event number when no issue or pull request is present", () => {
+      const context = new Context(
+        {
+          id: "123",
+          name: "pull_request",
+          payload: {
+            ...pullRequestEventPayload,
+            issue: undefined,
+            pull_request: undefined,
+            number: 9,
+          },
+        } as unknown as WebhookEvent<"pull_request">,
+        { hook: { before: () => {} } } as unknown as ProbotOctokit,
+        log,
+      );
+
+      expect(context.pullRequest().pull_number).toBe(9);
     });
   });
 
   describe("config", () => {
-    let octokit: InstanceType<typeof ProbotOctokit>;
-
-    function nockConfigResponseDataFile(fileName: string) {
+    function getConfigFile(fileName: string) {
       const configPath = path.join(__dirname, "fixtures", "config", fileName);
       return fs.readFileSync(configPath, { encoding: "utf8" });
     }
 
-    beforeEach(() => {
-      octokit = new ProbotOctokit({
+    it("gets a valid configuration", async () => {
+      const mock = fetchMock
+        .createInstance()
+        .getOnce(
+          "https://api.github.com/repos/Codertocat/Hello-World/contents/.github%2Ftest-file.yml",
+          getConfigFile("basic.yml"),
+        );
+
+      const octokit = new ProbotOctokit({
         retry: { enabled: false },
         throttle: { enabled: false },
+        request: {
+          fetch: mock.fetchHandler,
+        },
       });
-      // @ts-ignore - Expression produces a union type that is too complex to represent
-      context = new Context(event, octokit, {} as any);
-    });
+      const context = new Context(event, octokit, log);
 
-    it("gets a valid configuration", async () => {
-      const mock = nock("https://api.github.com")
-        .get("/repos/Codertocat/Hello-World/contents/.github%2Ftest-file.yml")
-        .reply(200, nockConfigResponseDataFile("basic.yml"));
+      const config =
+        await context.config<Record<string, number>>("test-file.yml");
 
-      const config = await context.config("test-file.yml");
-      expect(config).toEqual({
-        bar: 7,
-        baz: 11,
-        foo: 5,
-      });
-      expect(mock.activeMocks()).toStrictEqual([]);
+      expect(typeof config).toBe("object");
+      if (!config) throw new Error("Expected configuration");
+      expect(Object.keys(config).length).toBe(3);
+      expect(config.foo).toBe(5);
+      expect(config.bar).toBe(7);
+      expect(config.baz).toBe(11);
     });
 
     it("returns null when the file and base repository are missing", async () => {
-      const mock = nock("https://api.github.com")
-        .get("/repos/Codertocat/Hello-World/contents/.github%2Ftest-file.yml")
-        .reply(404)
-        .get("/repos/Codertocat/.github/contents/.github%2Ftest-file.yml")
-        .reply(404);
+      const NOT_FOUND_RESPONSE = {
+        status: 404,
+        body: {
+          message: "Not Found",
+          documentation_url:
+            "https://docs.github.com/rest/reference/repos#get-repository-content",
+        },
+      };
+
+      const mock = fetchMock
+        .createInstance()
+        .getOnce(
+          "https://api.github.com/repos/Codertocat/Hello-World/contents/.github%2Ftest-file.yml",
+          NOT_FOUND_RESPONSE,
+        )
+        .getOnce(
+          "https://api.github.com/repos/Codertocat/.github/contents/.github%2Ftest-file.yml",
+          NOT_FOUND_RESPONSE,
+        );
+
+      const octokit = new ProbotOctokit({
+        retry: { enabled: false },
+        throttle: { enabled: false },
+        request: {
+          fetch: mock.fetchHandler,
+        },
+      });
+      const context = new Context(event, octokit, log);
 
       expect(await context.config("test-file.yml")).toBe(null);
-      expect(mock.activeMocks()).toStrictEqual([]);
     });
 
     it("accepts deepmerge options", async () => {
-      const mock = nock("https://api.github.com")
-        .get("/repos/Codertocat/Hello-World/contents/.github%2Ftest-file.yml")
-        .reply(
-          200,
-          "foo:\n  - name: master\n    shouldChange: changed\n_extends: .github"
+      const mock = fetchMock
+        .createInstance()
+        .getOnce(
+          "https://api.github.com/repos/Codertocat/Hello-World/contents/.github%2Ftest-file.yml",
+          "foo:\n  - name: master\n    shouldChange: changed\n_extends: .github",
         )
-        .get("/repos/Codertocat/.github/contents/.github%2Ftest-file.yml")
-        .reply(
-          200,
-          "foo:\n  - name: develop\n  - name: master\n    shouldChange: should"
+        .getOnce(
+          "https://api.github.com/repos/Codertocat/.github/contents/.github%2Ftest-file.yml",
+          "foo:\n  - name: develop\n  - name: master\n    shouldChange: should",
         );
 
-      const customMerge = jest.fn(
-        (_target: any[], _source: any[], _options: any): any[] => []
-      );
-      await context.config("test-file.yml", {}, { arrayMerge: customMerge });
-      expect(customMerge).toHaveBeenCalled();
-      expect(mock.activeMocks()).toStrictEqual([]);
+      const octokit = new ProbotOctokit({
+        retry: { enabled: false },
+        throttle: { enabled: false },
+        request: {
+          fetch: mock.fetchHandler,
+        },
+      });
+      const context = new Context(event, octokit, log);
+
+      let customMergeCalled = false;
+      const customMerge = () => {
+        customMergeCalled = true;
+        return () => [];
+      };
+      await context.config("test-file.yml", {}, { mergeArray: customMerge });
+      expect(customMergeCalled).toBe(true);
+    });
+
+    it("sets x-github-delivery header to event id", async () => {
+      const mock = fetchMock.createInstance().getOnce("*", ({ options }) => {
+        // @ts-expect-error
+        expect(options.headers["x-github-delivery"]).toBe("0");
+        return getConfigFile("basic.yml");
+      });
+
+      const octokit = new ProbotOctokit({
+        retry: { enabled: false },
+        throttle: { enabled: false },
+        request: {
+          fetch: mock.fetchHandler,
+        },
+      });
+      const context = new Context(event, octokit, log);
+      await context.config("test-file.yml");
     });
   });
 
   describe("isBot", () => {
     test("returns true if sender is a bot", () => {
-      event.payload.sender.type = "Bot";
-      context = new Context(event, {} as any, {} as any);
+      event.payload.sender!.type = "Bot";
+      const octokit = {
+        hook: {
+          before: () => {},
+        },
+      };
+      context = new Context(event, octokit as unknown as ProbotOctokit, log);
 
       expect(context.isBot).toBe(true);
     });
 
     test("returns false if sender is not a bot", () => {
-      event.payload.sender.type = "User";
-      context = new Context(event, {} as any, {} as any);
+      event.payload.sender!.type = "User";
+      const octokit = {
+        hook: {
+          before: () => {},
+        },
+      };
+      context = new Context(event, octokit as unknown as ProbotOctokit, log);
 
       expect(context.isBot).toBe(false);
     });

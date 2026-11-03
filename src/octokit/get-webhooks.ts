@@ -1,19 +1,24 @@
 import { Webhooks } from "@octokit/webhooks";
+import type { Logger } from "pino";
 
-import { State } from "../types";
-import { getErrorHandler } from "../helpers/get-error-handler";
-import { webhookTransform } from "./octokit-webhooks-transform";
+import type { ProbotOctokit } from "./probot-octokit.js";
+import type { ProbotWebhooks } from "../types.js";
 
-// import { Context } from "../context";
+import { getErrorHandler } from "../helpers/get-error-handler.js";
+import { webhookTransform } from "./octokit-webhooks-transform.js";
 
-export function getWebhooks(state: State) {
-  // TODO: This should be webhooks = new Webhooks<Context>({...}) but fails with
-  //       > The context of the event that was triggered, including the payload and
-  //         helpers for extracting information can be passed to GitHub API calls
+type GetWebhooksOptions = {
+  log: Logger;
+  octokit: ProbotOctokit;
+  webhookSecret: string;
+};
+
+export function getWebhooks(options: GetWebhooksOptions): ProbotWebhooks {
   const webhooks = new Webhooks({
-    secret: state.webhooks.secret!,
-    transform: webhookTransform.bind(null, state),
+    log: options.log,
+    secret: options.webhookSecret,
+    transform: (event) => webhookTransform(options, event),
   });
-  webhooks.onError(getErrorHandler(state.log));
+  webhooks.onError(getErrorHandler(options.log));
   return webhooks;
 }

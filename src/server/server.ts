@@ -1,129 +1,323 @@
-import { Server as HttpServer } from "http";
+import { Server as HttpServer } from "node:http";
+import type { AddressInfo } from "node:net";
 
-import express, { Application, Router } from "express";
-import { join } from "path";
-import { Logger } from "pino";
-import { createNodeMiddleware as createWebhooksMiddleware } from "@octokit/webhooks";
+import type { RequestRequestOptions } from "@octokit/types";
+import type { Logger } from "pino";
 
-import { getLog } from "../helpers/get-log";
-import { getLoggingMiddleware } from "./logging-middleware";
-import { createWebhookProxy } from "../helpers/webhook-proxy";
-import { VERSION } from "../version";
-import { ApplicationFunction, ServerOptions } from "../types";
-import { Probot } from "../";
-import { engine } from "express-handlebars";
+import { Probot } from "../probot.js";
+import { VERSION } from "../version.js";
+import type {
+  ApplicationFunction,
+  Handler,
+  HandlerFactory,
+  MiddlewareHandler,
+  ServerOptions,
+} from "../types.js";
+
+import {
+  createDeferredPromise,
+  type DeferredPromise,
+} from "../helpers/create-deferred-promise.js";
+import { createWebhookProxy } from "../helpers/webhook-proxy.js";
+import { getPrintableHost } from "../helpers/get-printable-host.js";
+import { getRuntimeName } from "../helpers/get-runtime-name.js";
+import { getRuntimeVersion } from "../helpers/get-runtime-version.js";
+import { requireValue } from "../helpers/require-value.js";
+
+import { httpLogger } from "./handlers/http-logger.js";
+import { notFoundHandler } from "./handlers/not-found.js";
+import { pingHandler } from "./handlers/ping.js";
+import { staticFilesHandler } from "./handlers/static-files.js";
+import { getLog } from "../helpers/get-log.js";
+
+// the default path as defined in @octokit/webhooks
+export const defaultWebhookPath = "/api/github/webhooks";
+export const defaultWebhookSecret = "development";
+
+function isAddressInfo(address: unknown): address is AddressInfo {
+  if (typeof address !== "object" || address === null) {
+    return false;
+  }
+
+  const candidate = address as Record<string, unknown>;
+  return (
+    typeof candidate.port === "number" &&
+    typeof candidate.address === "string" &&
+    (typeof candidate.family === "string" ||
+      typeof candidate.family === "number")
+  );
+}
+
+export function validateAddressInfo(address: unknown): AddressInfo {
+  if (!isAddressInfo(address)) {
+    throw new Error("Unable to determine the server address");
+  }
+
+  return address;
+}
 
 type State = {
-  httpServer?: HttpServer;
-  port?: number;
-  host?: string;
+  initializeRan: boolean;
+  initializationPromise: DeferredPromise<void>;
+  cwd: string;
+  httpServer: HttpServer;
+  port: number;
+  host: string;
+  log?: Logger | undefined;
+  getLog: NonNullable<ServerOptions["getLog"]>;
+  loggingOptions?: NonNullable<ServerOptions["loggingOptions"]>;
+  probot: Probot | null;
+  ProbotBase: typeof Probot;
+  request?: RequestRequestOptions | undefined;
   webhookPath: string;
-  webhookProxy?: string;
-  eventSource?: EventSource;
+  webhookProxy?: string | undefined;
+  loadSmeeClient?: ServerOptions["loadSmeeClient"];
+  eventSource: EventSource | undefined;
+  httpLogger?: ReturnType<typeof httpLogger>;
+  handlers: Handler[];
+  addedHandlers: Handler[];
+  enablePing: boolean;
+  enableNotFound: boolean;
+  enableStaticFiles: boolean;
 };
 
 export class Server {
-  static version = VERSION;
+  #state: State;
 
-  public expressApp: Application;
-  public log: Logger;
-  public version = VERSION;
-  public probotApp: Probot;
-
-  private state: State;
-
-  constructor(options: ServerOptions = {} as ServerOptions) {
-    this.expressApp = express();
-    this.log = options.log || getLog().child({ name: "server" });
-    this.probotApp = new options.Probot();
-
-    this.state = {
-      port: options.port,
-      host: options.host,
-      webhookPath: options.webhookPath || "/",
+  constructor(options: ServerOptions = { Probot }) {
+    this.#state = {
+      initializeRan: false,
+      initializationPromise: createDeferredPromise<void>(),
+      probot: null,
+      log: options.log,
+      getLog: options.getLog || getLog,
+      httpServer: new HttpServer(),
+      cwd: options.cwd || process.cwd(),
+      port: options.port || 3000,
+      host: options.host || "localhost",
+      webhookPath: options.webhookPath || defaultWebhookPath,
       webhookProxy: options.webhookProxy,
+      loadSmeeClient: options.loadSmeeClient,
+      eventSource: undefined,
+      request: options.request,
+      ProbotBase: options.Probot || Probot,
+      addedHandlers: [],
+      handlers: [],
+      enablePing: options.enablePing ?? true,
+      enableNotFound: options.enableNotFound ?? true,
+      enableStaticFiles: options.enableStaticFiles ?? true,
     };
 
-    this.expressApp.use(getLoggingMiddleware(this.log));
-    this.expressApp.use(
-      "/probot/static/",
-      express.static(join(__dirname, "..", "..", "static"))
-    );
-    this.expressApp.use(
-      this.state.webhookPath,
-      createWebhooksMiddleware(this.probotApp.webhooks, {
-        path: "/",
-      })
-    );
+    this.#state.httpServer.on("request", async (req, res) => {
+      requireValue(
+        this.#state.httpLogger,
+        "Server HTTP logger is not initialized",
+      )(req, res);
 
-    this.expressApp.engine(
-      "handlebars",
-      engine({
-        defaultLayout: false,
-      })
-    );
-    this.expressApp.set("view engine", "handlebars");
-    this.expressApp.set("views", join(__dirname, "..", "..", "views"));
-    this.expressApp.get("/ping", (req, res) => res.end("PONG"));
-  }
+      try {
+        for (const handler of this.#state.handlers) {
+          if (await handler(req, res)) {
+            return true;
+          }
+        }
+      } catch (e) {
+        requireValue(this.#state.log, "Server logger is not initialized").error(
+          e,
+        );
+        res.writeHead(500).end();
+        return true;
+      }
 
-  public async load(appFn: ApplicationFunction) {
-    await appFn(this.probotApp, {
-      getRouter: (path) => this.router(path),
+      return false;
     });
   }
 
-  public async start() {
-    this.log.info(
-      `Running Probot v${this.version} (Node.js: ${process.version})`
-    );
-    const port = this.state.port || 3000;
-    const { host, webhookPath, webhookProxy } = this.state;
-    const printableHost = host ?? "localhost";
+  async #initialize(): Promise<void> {
+    if (this.#state.initializeRan === true) {
+      return this.#state.initializationPromise.promise;
+    }
 
-    this.state.httpServer = (await new Promise((resolve, reject) => {
-      const server = this.expressApp.listen(
-        port,
-        ...((host ? [host] : []) as any),
+    this.#state.initializeRan = true;
+
+    try {
+      const log = (this.#state.log = (
+        this.#state.log || (await this.#state.getLog())
+      ).child({ name: "server" }));
+
+      await (this.#state.probot = createProbot(this.#state, this, log)).ready();
+
+      this.#state.httpLogger = httpLogger(log, this.#state.loggingOptions);
+
+      this.#state.initializationPromise.resolve();
+    } catch (error) {
+      this.#state.initializationPromise.reject(error);
+      if (this.#state.log) {
+        this.#state.log.error({ err: error }, "Failed to initialize Server");
+      } else {
+        console.error("Failed to initialize Server", error);
+      }
+      throw error;
+    }
+    return this.#state.initializationPromise.promise;
+  }
+
+  public addHandler(handler: Handler | MiddlewareHandler) {
+    this.#state.addedHandlers.push(handler as Handler);
+  }
+
+  public async loadHandlerFactory(appFn: HandlerFactory) {
+    await this.#initialize();
+
+    const handler = await appFn(
+      requireValue(this.#state.probot, "Probot is not initialized"),
+      {
+        cwd: this.#state.cwd,
+        addHandler: (handler: Handler | MiddlewareHandler) => {
+          this.addHandler(handler);
+        },
+      },
+    );
+
+    this.addHandler(handler);
+  }
+
+  public async load(appFn: ApplicationFunction) {
+    await this.#initialize();
+
+    await appFn(requireValue(this.#state.probot, "Probot is not initialized"), {
+      cwd: this.#state.cwd,
+      addHandler: (handler: Handler | MiddlewareHandler) => {
+        this.addHandler(handler);
+      },
+    });
+  }
+
+  public async start(): Promise<HttpServer> {
+    await this.#initialize();
+
+    this.#state.handlers = [];
+
+    if (this.#state.enableStaticFiles === true) {
+      this.#state.handlers.unshift(staticFilesHandler);
+    }
+
+    if (this.#state.enablePing === true) {
+      this.#state.handlers.unshift(pingHandler);
+    }
+
+    this.#state.handlers.unshift(
+      await requireValue(
+        this.#state.probot,
+        "Probot is not initialized",
+      ).getNodeMiddleware(),
+    );
+
+    this.#state.handlers.push(...this.#state.addedHandlers);
+
+    if (this.#state.enableNotFound === true) {
+      this.#state.handlers.push(notFoundHandler);
+    }
+
+    const runtimeName = getRuntimeName(globalThis);
+    const runtimeVersion = getRuntimeVersion(globalThis);
+
+    requireValue(this.#state.log, "Server logger is not initialized").info(
+      `Running Probot v${VERSION} (${runtimeName}: ${runtimeVersion})`,
+    );
+    const printableHost = getPrintableHost(this.#state.host);
+
+    this.#state.httpServer = await new Promise((resolve, reject) => {
+      const server = this.#state.httpServer.listen(
+        { port: this.#state.port, host: this.#state.host },
         () => {
-          if (webhookProxy) {
-            this.state.eventSource = createWebhookProxy({
-              logger: this.log,
-              path: webhookPath,
-              port: port,
-              url: webhookProxy,
-            }) as EventSource;
+          const { port, address, family } = validateAddressInfo(
+            server.address(),
+          );
+
+          this.#state.port = port;
+          this.#state.host = address;
+
+          if (family === "IPv6") {
+            this.#state.host = `[${address}]`;
           }
-          this.log.info(`Listening on http://${printableHost}:${port}`);
+
+          requireValue(
+            this.#state.log,
+            "Server logger is not initialized",
+          ).info(`Listening on http://${printableHost}:${port}`);
           resolve(server);
-        }
+        },
       );
 
       server.on("error", (error: NodeJS.ErrnoException) => {
         if (error.code === "EADDRINUSE") {
           error = Object.assign(error, {
-            message: `Port ${port} is already in use. You can define the PORT environment variable to use a different port.`,
+            message: `Port ${this.#state.port} is already in use. You can define the PORT environment variable to use a different port.`,
           });
         }
 
-        this.log.error(error);
+        requireValue(this.#state.log, "Server logger is not initialized").error(
+          error,
+        );
         reject(error);
       });
-    })) as HttpServer;
+    });
 
-    return this.state.httpServer;
+    if (this.#state.webhookProxy) {
+      this.#state.eventSource = await createWebhookProxy({
+        host: this.#state.host,
+        port: this.#state.port,
+        path: this.#state.webhookPath,
+        logger: requireValue(
+          this.#state.log,
+          "Server logger is not initialized",
+        ),
+        url: this.#state.webhookProxy,
+        loadSmeeClient: this.#state.loadSmeeClient,
+      });
+    }
+
+    return this.#state.httpServer;
   }
 
-  public async stop() {
-    if (this.state.eventSource) this.state.eventSource.close();
-    if (!this.state.httpServer) return;
-    const server = this.state.httpServer;
-    return new Promise((resolve) => server.close(resolve));
+  public async stop(): Promise<void> {
+    if (this.#state.eventSource) {
+      this.#state.eventSource.close();
+      this.#state.eventSource = undefined;
+    }
+    if (this.#state.httpServer.listening === false) {
+      return;
+    }
+    const server = this.#state.httpServer;
+    return new Promise((resolve, reject) =>
+      server.close((err) => {
+        err ? reject(err) : resolve();
+      }),
+    );
   }
 
-  public router(path: string = "/") {
-    const newRouter = Router();
-    this.expressApp.use(path, newRouter);
-    return newRouter;
+  get port(): number {
+    return this.#state.port;
   }
+
+  get host(): string {
+    return this.#state.host;
+  }
+
+  static get version(): string {
+    return VERSION;
+  }
+
+  get version(): string {
+    return VERSION;
+  }
+}
+
+function createProbot(state: State, server: Server, log: Logger): Probot {
+  return new state.ProbotBase({
+    request: state.request,
+    log,
+    server,
+    webhookPath: state.webhookPath,
+  });
 }

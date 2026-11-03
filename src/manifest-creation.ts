@@ -1,89 +1,150 @@
-import fs from "fs";
-import yaml from "js-yaml";
-import path from "path";
-import updateDotenv from "update-dotenv";
-import { ProbotOctokit } from "./octokit/probot-octokit";
+import fs from "node:fs";
+import path from "node:path";
+
+import { npxImport } from "npx-import-light";
+import yaml from "yaml";
+import type { RequestParameters } from "@octokit/types";
+import type { Logger } from "pino";
+
+import type { Env, Manifest, OctokitOptions, PackageJson } from "./types.js";
+import { ProbotOctokit } from "./octokit/probot-octokit.js";
+import { loadPackageJson } from "./helpers/load-package-json.js";
+import { updateEnv } from "./helpers/update-env.js";
+
+type SmeeClient = {
+  createChannel: () => string | Promise<string | undefined>;
+};
+type SmeeClientModule = { SmeeClient: SmeeClient };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 export class ManifestCreation {
+  #updateEnv: typeof updateEnv;
+  #env: Env;
+
+  constructor(
+    options: {
+      updateEnv?: typeof updateEnv;
+      env?: Env;
+    } = { updateEnv },
+  ) {
+    this.#env = options.env || process.env;
+    this.#updateEnv =
+      options.updateEnv || ((values) => updateEnv(values, { env: this.#env }));
+  }
   get pkg() {
-    let pkg: any;
-    try {
-      pkg = require(path.join(process.cwd(), "package.json"));
-    } catch (e) {
-      pkg = {};
-    }
-    return pkg;
+    return loadPackageJson();
   }
 
-  public async createWebhookChannel() {
+  public async createWebhookChannel({
+    SmeeClient: SmeeClientParam,
+    log = console,
+  }: {
+    SmeeClient?: SmeeClient | undefined;
+    log?: Pick<Logger, "warn"> | undefined;
+  } = {}): Promise<string | undefined> {
+    let SmeeClient: SmeeClient;
     try {
-      // tslint:disable:no-var-requires
-      const SmeeClient = require("smee-client");
-
-      await this.updateEnv({
-        WEBHOOK_PROXY_URL: await SmeeClient.createChannel(),
+      SmeeClient =
+        SmeeClientParam ||
+        (
+          await npxImport<SmeeClientModule>("smee-client@5.0.0", {
+            onlyPackageRunner: true,
+          })
+        ).SmeeClient;
+    } catch {
+      log.warn("SmeeClient is not available");
+      return void 0;
+    }
+    try {
+      const WEBHOOK_PROXY_URL = await SmeeClient.createChannel();
+      this.#updateEnv({
+        WEBHOOK_PROXY_URL,
       });
-    } catch (error) {
-      // Smee is not available, so we'll just move on
-      // tslint:disable:no-console
-      console.warn("Unable to connect to smee.io, try restarting your server.");
+      return WEBHOOK_PROXY_URL;
+    } catch {
+      log.warn("Unable to connect to smee.io, try restarting your server.");
+      return void 0;
     }
   }
 
-  public getManifest(pkg: any, baseUrl: any) {
-    let manifest: any = {};
+  public getManifest(options: {
+    pkg: PackageJson;
+    baseUrl: string;
+    readFileSync?: typeof fs.readFileSync;
+  }): string {
+    let manifest: Partial<Manifest> = {};
+
+    const { pkg, baseUrl, readFileSync = fs.readFileSync } = options;
+
     try {
-      const file = fs.readFileSync(path.join(process.cwd(), "app.yml"), "utf8");
-      manifest = yaml.safeLoad(file);
+      const file = readFileSync(path.join(process.cwd(), "app.yml"), "utf8");
+      const parsed: unknown = yaml.parse(file);
+      if (isRecord(parsed)) {
+        const parsedManifest: Partial<Manifest> = {};
+        if (typeof parsed.name === "string") parsedManifest.name = parsed.name;
+        if (typeof parsed.url === "string") parsedManifest.url = parsed.url;
+        if (typeof parsed.description === "string") {
+          parsedManifest.description = parsed.description;
+        }
+        if (typeof parsed.public === "boolean") {
+          parsedManifest.public = parsed.public;
+        }
+        manifest = parsedManifest;
+      }
     } catch (error) {
       // App config does not exist, which is ok.
-      if (error.code !== "ENOENT") {
+      if (
+        !(error instanceof Error && "code" in error && error.code === "ENOENT")
+      ) {
         throw error;
       }
     }
 
-    const generatedManifest = JSON.stringify(
-      Object.assign(
-        {
-          description: manifest.description || pkg.description,
-          hook_attributes: {
-            url: process.env.WEBHOOK_PROXY_URL || `${baseUrl}/`,
-          },
-          name: process.env.PROJECT_DOMAIN || manifest.name || pkg.name,
-          public: manifest.public || true,
-          redirect_url: `${baseUrl}/probot/setup`,
-          // TODO: add setup url
-          // setup_url:`${baseUrl}/probot/success`,
-          url: manifest.url || pkg.homepage || pkg.repository,
-          version: "v1",
-        },
-        manifest
-      )
-    );
+    const generatedManifest = JSON.stringify({
+      description: manifest.description || pkg.description,
+      hook_attributes: {
+        url: this.#env.WEBHOOK_PROXY_URL || `${baseUrl}/`,
+      },
+      name: this.#env.PROJECT_DOMAIN || manifest.name || pkg.name,
+      public: typeof manifest.public === "boolean" ? manifest.public : true,
+      redirect_url: `${baseUrl}/probot/setup`,
+      // TODO: add setup url
+      // setup_url:`${baseUrl}/probot/success`,
+      url: manifest.url || pkg.homepage || pkg.repository,
+      version: "v1",
+      ...manifest,
+    });
 
     return generatedManifest;
   }
 
-  public async createAppFromCode(code: any) {
-    const octokit = new ProbotOctokit();
-    const options: any = {
+  public async createAppFromCode(
+    code: string,
+    probotOptions?: OctokitOptions | undefined,
+  ) {
+    const octokit = new ProbotOctokit(probotOptions);
+    const options: RequestParameters = {
+      ...probotOptions,
       code,
       mediaType: {
         previews: ["fury"], // needed for GHES 2.20 and older
       },
-      ...(process.env.GHE_HOST && {
-        baseUrl: `${process.env.GHE_PROTOCOL || "https"}://${
-          process.env.GHE_HOST
+      ...(this.#env.GHE_HOST && {
+        baseUrl: `${this.#env.GHE_PROTOCOL || "https"}://${
+          this.#env.GHE_HOST
         }/api/v3`,
       }),
     };
     const response = await octokit.request(
       "POST /app-manifests/:code/conversions",
-      options
+      options,
     );
 
     const { id, client_id, client_secret, webhook_secret, pem } = response.data;
-    await this.updateEnv({
+    this.#updateEnv({
       APP_ID: id.toString(),
       PRIVATE_KEY: `"${pem}"`,
       WEBHOOK_SECRET: webhook_secret,
@@ -94,15 +155,10 @@ export class ManifestCreation {
     return response.data.html_url;
   }
 
-  public async updateEnv(env: any) {
-    // Needs to be public due to tests
-    return updateDotenv(env);
-  }
-
   get createAppUrl() {
-    const githubHost = process.env.GHE_HOST || `github.com`;
-    return `${process.env.GHE_PROTOCOL || "https"}://${githubHost}${
-      process.env.GH_ORG ? "/organizations/".concat(process.env.GH_ORG) : ""
+    const githubHost = this.#env.GHE_HOST || `github.com`;
+    return `${this.#env.GHE_PROTOCOL || "https"}://${githubHost}${
+      this.#env.GH_ORG ? `/organizations/${this.#env.GH_ORG}` : ""
     }/settings/apps/new`;
   }
 }

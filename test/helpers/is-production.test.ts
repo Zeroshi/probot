@@ -1,16 +1,18 @@
-import { isProduction } from "../../src/helpers/is-production";
+import { describe, expect, it } from "vitest";
+import { isProduction } from "../../src/helpers/is-production.js";
 
 describe("isProduction", () => {
-  it("returns true if the NODE_ENV is set to production", () => {
-    process.env.NODE_ENV = "production";
-    expect(isProduction()).toBe(true);
+  it("uses process.env when no environment is supplied", () => {
+    expect(isProduction()).toBe(process.env.NODE_ENV === "production");
   });
 
-  it.each([undefined, "dev", "test", ""])(
-    "returns false if the NODE_ENV is set to %s",
-    (value) => {
-      process.env.NODE_ENV = value;
-      expect(isProduction()).toBe(false);
-    }
-  );
+  it("returns true if the NODE_ENV is set to production", () => {
+    expect(isProduction({ NODE_ENV: "production" })).toBe(true);
+  });
+
+  [undefined, "dev", "test", ""].forEach((value) => {
+    it(`returns false if the NODE_ENV is set to ${value}`, () => {
+      expect(isProduction({ NODE_ENV: value })).toBe(false);
+    });
+  });
 });

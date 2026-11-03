@@ -1,22 +1,30 @@
-import LRUCache from "lru-cache";
-import { ProbotOctokit } from "./probot-octokit";
-import Redis from "ioredis";
-
-import { getOctokitThrottleOptions } from "./get-octokit-throttle-options";
-import { aliasLog } from "../helpers/alias-log";
-
+import { request } from "@octokit/request";
+import type { RequestRequestOptions } from "@octokit/types";
 import type { Logger } from "pino";
+import type { Lru } from "toad-cache";
+
+import type { OctokitOptions, RedisOptions } from "../types.js";
+import { PROBOT_OCTOKIT_DEFAULTS, ProbotOctokit } from "./probot-octokit.js";
+import { getOctokitThrottleOptions } from "./get-octokit-throttle-options.js";
 
 type Options = {
-  cache: LRUCache<number, string>;
+  cache: Lru<string>;
   Octokit: typeof ProbotOctokit;
   log: Logger;
-  githubToken?: string;
-  appId?: number;
-  privateKey?: string;
-  redisConfig?: Redis.RedisOptions | string;
-  baseUrl?: string;
+  githubToken?: string | undefined;
+  appId?: number | undefined;
+  privateKey?: string | undefined;
+  redisConfig?: RedisOptions | string | undefined;
+  baseUrl?: string | undefined;
+  request?: RequestRequestOptions | undefined;
 };
+
+export function mergeThrottleOptions(
+  runtimeOptions: NonNullable<OctokitOptions["throttle"]>,
+  explicitOptions?: OctokitOptions["throttle"],
+): NonNullable<OctokitOptions["throttle"]> {
+  return { ...runtimeOptions, ...explicitOptions };
+}
 
 /**
  * Returns an Octokit instance with default settings for authentication. If
@@ -28,38 +36,66 @@ type Options = {
  * Besides the authentication, the Octokit's baseUrl is set as well when run
  * against a GitHub Enterprise Server with a custom domain.
  */
-export function getProbotOctokitWithDefaults(options: Options) {
+export async function getProbotOctokitWithDefaults(
+  options: Options,
+): Promise<typeof ProbotOctokit> {
+  const authRequest = request.defaults({
+    ...(options.baseUrl ? { baseUrl: options.baseUrl } : {}),
+    request: {
+      fetch: options.request?.fetch,
+    },
+  });
+
   const authOptions = options.githubToken
     ? {
         token: options.githubToken,
+        request: authRequest,
       }
     : {
         cache: options.cache,
         appId: options.appId,
         privateKey: options.privateKey,
+        request: authRequest,
       };
 
-  const octokitThrottleOptions = getOctokitThrottleOptions({
-    log: options.log,
+  const log = options.log.child({ name: "octokit" });
+
+  const octokitThrottleOptions = await getOctokitThrottleOptions({
+    log,
     redisConfig: options.redisConfig,
   });
 
-  let defaultOptions: any = {
+  const defaultOptions: Partial<OctokitOptions> = {
+    log,
     auth: authOptions,
-    log: options.log.child
-      ? aliasLog(options.log.child({ name: "octokit" }))
-      : options.log,
   };
+
+  if (options.request) {
+    defaultOptions.request = options.request;
+  }
 
   if (options.baseUrl) {
     defaultOptions.baseUrl = options.baseUrl;
   }
 
-  if (octokitThrottleOptions) {
-    defaultOptions.throttle = octokitThrottleOptions;
+  // ProbotOctokit already provides the built-in throttling handlers. Only add
+  // the resolved options here when Redis-backed throttling was requested;
+  // otherwise this extra defaults layer would overwrite explicit options from
+  // `ProbotOctokit.defaults(...)` (for example, `{ enabled: false }` in tests).
+  if (options.redisConfig) {
+    const explicitDefaults = (
+      options.Octokit as typeof ProbotOctokit & {
+        [PROBOT_OCTOKIT_DEFAULTS]?: OctokitOptions;
+      }
+    )[PROBOT_OCTOKIT_DEFAULTS];
+
+    defaultOptions.throttle = mergeThrottleOptions(
+      octokitThrottleOptions,
+      explicitDefaults?.throttle,
+    );
   }
 
-  return options.Octokit.defaults((instanceOptions: any) => {
+  return options.Octokit.defaults((instanceOptions: OctokitOptions) => {
     const options = Object.assign({}, defaultOptions, instanceOptions, {
       auth: instanceOptions.auth
         ? Object.assign({}, defaultOptions.auth, instanceOptions.auth)
@@ -70,7 +106,7 @@ export function getProbotOctokitWithDefaults(options: Options) {
       options.throttle = Object.assign(
         {},
         defaultOptions.throttle,
-        instanceOptions.throttle
+        instanceOptions.throttle,
       );
     }
 

@@ -14,15 +14,16 @@
  * app.log.fatal("Goodbye, cruel world!");
  * ```
  */
-import pino, { Logger, LoggerOptions } from "pino";
-import { getTransformStream, Options, LogLevel } from "@probot/pino";
+import pino, { type Logger, type LoggerOptions } from "pino";
+import { getTransformStream, type Options } from "@probot/pino";
+import type { LogLevel } from "./validate-log-level.js";
 
 export type GetLogOptions = {
-  level?: LogLevel;
-  logMessageKey?: string;
+  level?: LogLevel | undefined;
+  logMessageKey?: string | undefined;
 } & Options;
 
-export function getLog(options: GetLogOptions = {}): Logger {
+export async function getLog(options: GetLogOptions = {}): Promise<Logger> {
   const { level, logMessageKey, ...getTransformStreamOptions } = options;
 
   const pinoOptions: LoggerOptions = {
@@ -30,10 +31,8 @@ export function getLog(options: GetLogOptions = {}): Logger {
     name: "probot",
     messageKey: logMessageKey || "msg",
   };
-  const transform = getTransformStream(getTransformStreamOptions);
-  // @ts-ignore TODO: check out what's wrong here
-  transform.pipe(pino.destination(1));
-  const log = pino(pinoOptions, transform);
+  const transform = await getTransformStream(getTransformStreamOptions);
+  transform.pipe(pino.destination(1) as unknown as NodeJS.WritableStream);
 
-  return log;
+  return pino(pinoOptions, transform);
 }
